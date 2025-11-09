@@ -1,0 +1,22 @@
+[project]
+name = "qbox-backend"
+version = "0.1.0"
+description = "QBox professional quant trading backend service"
+authors = [{ name = "QBox" }]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.30.0",
+    "pydantic>=2.8.2",
+    "pydantic-settings>=2.3.0",
+    "python-dotenv>=1.0.1",
+    "longport>=1.7.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3.0"]
+
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+requires-python = ">=3.12"

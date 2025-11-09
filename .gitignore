@@ -1,0 +1,37 @@
+# Node.js相关
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Python后端（常见缓存/环境）
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.db
+venv/
+env/
+*.egg-info/
+.DS_Store
+
+# Python环境和密钥
+.env
+
+
+# 其它
+.idea/
+.vscode/
+
+
+backend/storage/**/*.csv
+backend/storage/**/*.log
