@@ -89,6 +89,7 @@ class LiveDataTaskInfo(BaseModel):
     finished_at: Optional[datetime]
     data_id: Optional[str]
     message: Optional[str]
+    dst_labels: Optional[Dict[str, str]] = None
 
 
 class LiveSnapshotRequest(BaseModel):

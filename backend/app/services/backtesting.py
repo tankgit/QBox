@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import csv
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from app.services.data_tasks import DATA_TASKS
 from app.services.strategies import STRATEGY_REGISTRY, Strategy
 from app.utils.id_generator import generate_id
 from app.utils.scheduler import SCHEDULER, TaskStatus
+from pydantic import ValidationError
 
 
 def _now() -> datetime:
@@ -50,6 +52,228 @@ class BacktestManager:
         self.log_dir = log_dir
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.tasks: Dict[str, BacktestTaskState] = {}
+        self._load_existing_tasks()
+
+    def _meta_path(self, task_id: str) -> Path:
+        return self.log_dir / f"{task_id}.meta.json"
+
+    def _parse_datetime(self, value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    def _recalculate_metrics(self, request: BacktestRequest, trades: List[TradeLogEntry]) -> Dict[str, float]:
+        if not trades:
+            return {
+                "final_equity": request.initial_capital,
+                "total_return": 0.0,
+                "annualized_return": 0.0,
+                "max_drawdown": 0.0,
+                "win_rate": 0.0,
+                "total_trades": 0,
+                "profit_factor": float("inf"),
+            }
+
+        equity_curve: List[float] = [request.initial_capital]
+        max_equity = request.initial_capital
+        wins = 0
+        losses = 0
+        win_amount = 0.0
+        loss_amount = 0.0
+
+        for entry in trades:
+            equity = entry.value
+            equity_curve.append(equity)
+            pnl = equity - max_equity
+            if pnl >= 0:
+                wins += 1
+                win_amount += pnl
+            else:
+                losses += 1
+                loss_amount += abs(pnl)
+            max_equity = max(max_equity, equity)
+
+        final_equity = trades[-1].value
+        returns = (final_equity - request.initial_capital) / request.initial_capital
+        signal_frequency = max(request.signal_frequency_seconds, 1)
+        annualized_return = returns * (365 * 24 * 60 * 60 / signal_frequency)
+        win_rate = wins / len(trades) if trades else 0.0
+        profit_factor = (win_amount / loss_amount) if loss_amount > 0 else float("inf")
+
+        return {
+            "final_equity": final_equity,
+            "total_return": returns,
+            "annualized_return": annualized_return,
+            "max_drawdown": self._calculate_max_drawdown(equity_curve),
+            "win_rate": win_rate,
+            "total_trades": len(trades),
+            "profit_factor": profit_factor,
+        }
+
+    def _persist_task_state(self, state: BacktestTaskState) -> None:
+        meta = {
+            "task_id": state.task_id,
+            "status": state.status.value,
+            "created_at": state.created_at.isoformat(),
+            "started_at": state.started_at.isoformat() if state.started_at else None,
+            "finished_at": state.finished_at.isoformat() if state.finished_at else None,
+            "config": state.request.dict(),
+            "metrics": state.metrics,
+            "message": state.message,
+        }
+        try:
+            with self._meta_path(state.task_id).open("w", encoding="utf-8") as fp:
+                json.dump(meta, fp)
+        except OSError:
+            pass
+
+    def _load_existing_tasks(self) -> None:
+        meta_map: Dict[str, dict] = {}
+        for meta_path in sorted(self.log_dir.glob("*.meta.json")):
+            try:
+                with meta_path.open("r", encoding="utf-8") as fp:
+                    meta = json.load(fp)
+            except (OSError, json.JSONDecodeError):
+                continue
+
+            task_id = meta.get("task_id")
+            if not task_id:
+                name = meta_path.name
+                if name.endswith(".meta.json"):
+                    task_id = name[: -len(".meta.json")]
+                else:
+                    continue
+            meta_map[task_id] = meta
+
+        processed: set[str] = set()
+
+        for task_id, meta in meta_map.items():
+            config_data = meta.get("config")
+            if not config_data:
+                continue
+            try:
+                request = BacktestRequest(**config_data)
+            except ValidationError:
+                continue
+
+            log_path = self.log_dir / f"{task_id}.log"
+            trades: List[TradeLogEntry] = []
+            if log_path.exists():
+                try:
+                    with log_path.open("r", encoding="utf-8") as fp:
+                        first_line = fp.readline()
+                        if not first_line:
+                            continue
+                        fp.readline()
+                        reader = csv.reader(fp)
+                        for row in reader:
+                            if len(row) != 7:
+                                continue
+                            timestamp, action, price, quantity, cash, position, value = row
+                            trades.append(
+                                TradeLogEntry(
+                                    timestamp=timestamp,
+                                    action=action,
+                                    price=float(price),
+                                    quantity=float(quantity),
+                                    cash=float(cash),
+                                    position=float(position),
+                                    value=float(value),
+                                )
+                            )
+                except (OSError, ValueError):
+                    trades = []
+
+            metrics = meta.get("metrics")
+            if metrics is None and trades:
+                metrics = self._recalculate_metrics(request, trades)
+
+            status_value = meta.get("status", TaskStatus.PAUSED.value)
+            try:
+                status = TaskStatus(status_value)
+            except ValueError:
+                status = TaskStatus.PAUSED
+
+            created_at = self._parse_datetime(meta.get("created_at"))
+            started_at = self._parse_datetime(meta.get("started_at"))
+            finished_at = self._parse_datetime(meta.get("finished_at"))
+
+            if not created_at and log_path.exists():
+                stat = log_path.stat()
+                created_at = datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc)
+                finished_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+                if trades and not started_at:
+                    started_at = created_at
+
+            state = BacktestTaskState(
+                task_id=task_id,
+                request=request,
+                status=status,
+                created_at=created_at or datetime.now(timezone.utc),
+                started_at=started_at,
+                finished_at=finished_at,
+                metrics=metrics,
+                message=meta.get("message"),
+                log_path=log_path,
+                trades=trades,
+            )
+            self.tasks[task_id] = state
+            processed.add(task_id)
+
+        for log_path in sorted(self.log_dir.glob("*.log")):
+            task_id = log_path.stem
+            if task_id in processed:
+                continue
+
+            try:
+                with log_path.open("r", encoding="utf-8") as fp:
+                    first_line = fp.readline().strip()
+                    if not first_line:
+                        continue
+                    config_data = json.loads(first_line)
+                    request = BacktestRequest(**config_data)
+                    fp.readline()
+                    trades: List[TradeLogEntry] = []
+                    reader = csv.reader(fp)
+                    for row in reader:
+                        if len(row) != 7:
+                            continue
+                        timestamp, action, price, quantity, cash, position, value = row
+                        trades.append(
+                            TradeLogEntry(
+                                timestamp=timestamp,
+                                action=action,
+                                price=float(price),
+                                quantity=float(quantity),
+                                cash=float(cash),
+                                position=float(position),
+                                value=float(value),
+                            )
+                        )
+            except (OSError, json.JSONDecodeError, ValidationError, ValueError):
+                continue
+
+            stat = log_path.stat()
+            created_at = datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc)
+            finished_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+            status = TaskStatus.COMPLETED if trades else TaskStatus.PAUSED
+            metrics = self._recalculate_metrics(request, trades) if trades else None
+
+            state = BacktestTaskState(
+                task_id=task_id,
+                request=request,
+                status=status,
+                created_at=created_at,
+                started_at=created_at if trades else None,
+                finished_at=finished_at if trades else None,
+                metrics=metrics,
+                log_path=log_path,
+                trades=trades,
+            )
+            self.tasks[task_id] = state
 
     def create_task(self, request: BacktestRequest) -> BacktestTaskInfo:
         task_id = generate_id("test_")
@@ -60,11 +284,13 @@ class BacktestManager:
             log_path=self.log_dir / f"{task_id}.log",
         )
         self.tasks[task_id] = state
+        self._persist_task_state(state)
 
         async def runner() -> None:
             state.started_at = _now()
             await self._run_backtest(state)
             state.finished_at = _now()
+            self._persist_task_state(state)
 
         SCHEDULER.create(task_id, runner)
         return self.describe_task(task_id)
@@ -177,6 +403,7 @@ class BacktestManager:
         }
         state.metrics = metrics
         state.status = TaskStatus.COMPLETED
+        self._persist_task_state(state)
 
     def _load_data_series(self, data_id: str):
         try:
@@ -218,18 +445,21 @@ class BacktestManager:
         SCHEDULER.pause(task_id)
         state = self.tasks[task_id]
         state.status = TaskStatus.PAUSED
+        self._persist_task_state(state)
         return self.describe_task(task_id)
 
     def resume(self, task_id: str) -> BacktestTaskInfo:
         SCHEDULER.resume(task_id)
         state = self.tasks[task_id]
         state.status = TaskStatus.RUNNING
+        self._persist_task_state(state)
         return self.describe_task(task_id)
 
     def stop(self, task_id: str) -> BacktestTaskInfo:
         SCHEDULER.stop(task_id)
         state = self.tasks[task_id]
         state.status = TaskStatus.STOPPED
+        self._persist_task_state(state)
         return self.describe_task(task_id)
 
     def delete(self, task_id: str) -> None:
@@ -237,6 +467,9 @@ class BacktestManager:
         state = self.tasks.pop(task_id, None)
         if state and state.log_path.exists():
             state.log_path.unlink()
+        meta_path = self._meta_path(task_id)
+        if meta_path.exists():
+            meta_path.unlink()
 
 
 BACKTEST_MANAGER = BacktestManager(CONFIG.log_storage_path / "backtests")

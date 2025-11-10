@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 
 
 class TaskStatus(str, Enum):
+    WAITING = "waiting"
     RUNNING = "running"
     PAUSED = "paused"
     STOPPED = "stopped"

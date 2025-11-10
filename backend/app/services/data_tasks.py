@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from app.config import CONFIG
 from app.models import (
@@ -20,10 +21,14 @@ from app.services.longport_client import LONGPORT_CLIENT, MissingCredentialsErro
 from app.utils.file_storage import read_series, write_series
 from app.utils.id_generator import generate_id
 from app.utils.scheduler import SCHEDULER, TaskStatus
+from app.utils.trading_sessions import contains_session, get_dst_labels, resolve_sessions
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -48,12 +53,129 @@ class DataTaskManager:
         self.tasks: Dict[str, LiveDataTaskState] = {}
         self.snapshots_dir.mkdir(parents=True, exist_ok=True)
         self.live_dir.mkdir(parents=True, exist_ok=True)
+        self._load_existing_live_tasks()
+
+    def _load_existing_live_tasks(self) -> None:
+        for file_path in sorted(self.live_dir.glob("task_*.csv")):
+            try:
+                stored = read_series(file_path)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Failed to read live task file %s: %s", file_path, exc)
+                continue
+
+            config = stored.config or {}
+            task_id = str(config.get("task_id") or file_path.stem)
+
+            try:
+                request = self._build_request_from_config(config)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Skipping live task %s due to invalid config: %s", task_id, exc)
+                continue
+
+            created_at = self._parse_datetime(config.get("created_at")) or _now()
+            started_at = self._parse_datetime(config.get("started_at"))
+            finished_at = self._parse_datetime(config.get("finished_at"))
+
+            status_value = config.get("status")
+            status = TaskStatus.PAUSED
+            if isinstance(status_value, str):
+                try:
+                    status = TaskStatus(status_value)
+                except ValueError:
+                    LOGGER.debug(
+                        "Unknown status '%s' for live task %s, defaulting to paused",
+                        status_value,
+                        task_id,
+                    )
+
+            state = LiveDataTaskState(
+                task_id=task_id,
+                config=request,
+                created_at=created_at,
+                started_at=started_at,
+                finished_at=finished_at,
+                status=status,
+                message=config.get("message"),
+                data_file=file_path,
+                data_id=config.get("data_id"),
+            )
+            self.tasks[task_id] = state
+
+    @staticmethod
+    def _parse_datetime(value: Any) -> Optional[datetime]:
+        if not value or not isinstance(value, str):
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _parse_optional_int(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _parse_bool(value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "1", "yes", "y"}:
+                return True
+            if lowered in {"false", "0", "no", "n"}:
+                return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return default
+
+    def _build_request_from_config(self, config: Dict[str, Any]) -> LiveDataTaskRequest:
+        account_mode = config.get("account_mode") or "paper"
+        payload: Dict[str, Any] = {
+            "symbol": config.get("symbol"),
+            "session": config.get("session"),
+            "interval_seconds": max(self._parse_optional_int(config.get("interval_seconds")) or 1, 1),
+            "duration_seconds": self._parse_optional_int(config.get("duration_seconds")),
+            "is_permanent": self._parse_bool(config.get("is_permanent"), default=False),
+            "max_points": self._parse_optional_int(config.get("max_points")),
+            "account_mode": str(account_mode),
+        }
+
+        if payload["duration_seconds"] is None:
+            duration_minutes = self._parse_optional_int(config.get("duration_minutes"))
+            if duration_minutes:
+                payload["duration_seconds"] = max(duration_minutes * 60, 1)
+        if payload["is_permanent"]:
+            payload["duration_seconds"] = None
+        elif payload["duration_seconds"] is None:
+            raise ValueError("duration_seconds missing for non-permanent task")
+
+        if payload["max_points"] is not None and payload["max_points"] < 1:
+            payload["max_points"] = None
+
+        missing_fields = [key for key in ("symbol", "session") if not payload.get(key)]
+        if missing_fields:
+            raise ValueError(f"missing required fields: {', '.join(missing_fields)}")
+
+        return LiveDataTaskRequest(**payload)
 
     def list_live_tasks(self) -> List[LiveDataTaskInfo]:
         infos: List[LiveDataTaskInfo] = []
         for state in self.tasks.values():
             scheduler_task = SCHEDULER.get(state.task_id)
             status = scheduler_task.status.value if scheduler_task else state.status.value
+            session_definitions = resolve_sessions(state.config.session)
+            dst_labels = get_dst_labels(session_definitions) if session_definitions else None
             info = LiveDataTaskInfo(
                 task_id=state.task_id,
                 symbol=state.config.symbol,
@@ -69,6 +191,7 @@ class DataTaskManager:
                 finished_at=state.finished_at,
                 data_id=state.data_id,
                 message=state.message,
+                dst_labels=dst_labels,
             )
             infos.append(info)
         return infos
@@ -103,6 +226,8 @@ class DataTaskManager:
             config_payload["created_at"] = state.started_at.isoformat()
             if request.duration_seconds is not None:
                 config_payload["duration_minutes"] = max(int(request.duration_seconds // 60), 0)
+            session_definitions = resolve_sessions(request.session)
+            config_payload["dst_labels"] = get_dst_labels(session_definitions, state.started_at)
             with state.data_file.open("w", newline="", encoding="utf-8") as fp:
                 fp.write(json.dumps(config_payload) + "\n")
                 writer = csv.DictWriter(fp, fieldnames=header)
@@ -110,6 +235,7 @@ class DataTaskManager:
 
             end_time = _now() + timedelta(seconds=request.duration_seconds) if request.duration_seconds else None
             pause_started: Optional[datetime] = None
+            waiting_started: Optional[datetime] = None
             try:
                 while True:
                     now = _now()
@@ -118,6 +244,25 @@ class DataTaskManager:
                             pause_started = now
                         await asyncio.sleep(0.5)
                         continue
+                    if not contains_session(session_definitions, now):
+                        if waiting_started is None:
+                            waiting_started = now
+                        if state.status != TaskStatus.WAITING:
+                            state.status = TaskStatus.WAITING
+                            scheduler_task = SCHEDULER.get(task_id)
+                            if scheduler_task is not None:
+                                scheduler_task.status = TaskStatus.WAITING
+                        await asyncio.sleep(1.0)
+                        continue
+                    if state.status == TaskStatus.WAITING:
+                        state.status = TaskStatus.RUNNING
+                        scheduler_task = SCHEDULER.get(task_id)
+                        if scheduler_task is not None:
+                            scheduler_task.status = TaskStatus.RUNNING
+                    if waiting_started is not None:
+                        if end_time is not None:
+                            end_time += now - waiting_started
+                        waiting_started = None
                     if pause_started is not None:
                         if end_time is not None:
                             end_time += now - pause_started
@@ -154,11 +299,9 @@ class DataTaskManager:
                     raise RuntimeError("Quote response empty")
                 quote = response[0]
                 price = getattr(quote, "last_done", None)
-                if price and getattr(price, "price", None) is not None:
-                    return float(price.price)
-                if getattr(quote, "last", None) is not None:
-                    return float(quote.last)
-                raise RuntimeError("Unable to extract price from quote response")
+                if price is None:
+                    raise RuntimeError("Quote has no last_done price")
+                return float(price)
 
         try:
             return await asyncio.to_thread(fetch)
@@ -296,9 +439,12 @@ class DataTaskManager:
         return self.describe_live_task(task_id)
 
     def stop_task(self, task_id: str) -> LiveDataTaskInfo:
-        SCHEDULER.stop(task_id)
         state = self.tasks[task_id]
+        scheduler_task = SCHEDULER.get(task_id)
+        if scheduler_task is not None:
+            SCHEDULER.stop(task_id)
         state.status = TaskStatus.STOPPED
+        state.finished_at = state.finished_at or _now()
         return self.describe_live_task(task_id)
 
     def delete_task(self, task_id: str) -> None:

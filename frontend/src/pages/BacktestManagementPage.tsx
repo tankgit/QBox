@@ -34,10 +34,78 @@ interface BacktestTask {
   created_at?: string;
 }
 
+interface StrategyParameter {
+  name: string;
+  parameter_type: string;
+  description: string;
+  default: number | string | boolean;
+  minimum?: number;
+  maximum?: number;
+}
+
 interface Strategy {
   strategy_id: string;
   name: string;
+  description: string;
+  parameters: StrategyParameter[];
 }
+
+const buildDefaultStrategyParams = (strategy: Strategy | undefined): Record<string, string> => {
+  if (!strategy) {
+    return {};
+  }
+  return strategy.parameters.reduce<Record<string, string>>((acc, parameter) => {
+    const defaultValue = parameter.default;
+    if (defaultValue === undefined || defaultValue === null) {
+      acc[parameter.name] = "";
+    } else if (typeof defaultValue === "boolean") {
+      acc[parameter.name] = defaultValue ? "true" : "false";
+    } else {
+      acc[parameter.name] = String(defaultValue);
+    }
+    return acc;
+  }, {});
+};
+
+const coerceStrategyParameterValue = (parameter: StrategyParameter, rawValue: string | undefined) => {
+  const type = parameter.parameter_type.toLowerCase();
+  if (type === "int" || type === "integer") {
+    const parsed = rawValue !== undefined ? Number(rawValue) : Number.NaN;
+    if (Number.isFinite(parsed)) {
+      return Math.round(parsed);
+    }
+    if (typeof parameter.default === "number") {
+      return Math.round(parameter.default);
+    }
+    return 0;
+  }
+  if (type === "float" || type === "double" || type === "number") {
+    const parsed = rawValue !== undefined ? Number(rawValue) : Number.NaN;
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+    if (typeof parameter.default === "number") {
+      return parameter.default;
+    }
+    return 0;
+  }
+  if (type === "bool" || type === "boolean") {
+    if (rawValue === "true" || rawValue === "false") {
+      return rawValue === "true";
+    }
+    if (typeof parameter.default === "boolean") {
+      return parameter.default;
+    }
+    return false;
+  }
+  if (rawValue !== undefined) {
+    return rawValue;
+  }
+  if (parameter.default === undefined || parameter.default === null) {
+    return "";
+  }
+  return String(parameter.default);
+};
 
 interface DataItem {
   data_id: string;
@@ -49,6 +117,12 @@ interface DataDetail {
   symbol: string;
   data: Array<{ timestamp: string; price: number }>;
 }
+
+type ChartTrade = {
+  timestamp: string;
+  price: number;
+  action: "buy" | "sell";
+};
 
 export function BacktestManagementPage() {
   const client = useQueryClient();
@@ -68,7 +142,8 @@ export function BacktestManagementPage() {
     min_position: 0,
     max_position: 1,
     data_frequency_seconds: 60,
-    signal_frequency_seconds: 60
+    signal_frequency_seconds: 60,
+    strategy_params: {} as Record<string, string>
   });
 
   const tasksQuery = useQuery({
@@ -106,24 +181,54 @@ export function BacktestManagementPage() {
     ]
   });
 
+  const strategies = strategiesQuery.data ?? [];
+  const simulatedDataOptions = (dataSourcesQuery[0]?.data as DataItem[] | undefined) ?? [];
+  const snapshotDataOptions = (dataSourcesQuery[1]?.data as DataItem[] | undefined) ?? [];
+
   useEffect(() => {
-    if (!form.data_id) {
-      const simulated = dataSourcesQuery[0].data;
-      if (simulated && simulated.length > 0) {
-        setForm((prev) => ({ ...prev, data_id: simulated[0].data_id }));
-      }
+    if (!form.data_id && simulatedDataOptions.length > 0) {
+      setForm((prev) => ({ ...prev, data_id: simulatedDataOptions[0].data_id }));
+    }
+  }, [form.data_id, simulatedDataOptions]);
+
+  useEffect(() => {
+    if (strategies.length === 0) {
+      return;
     }
     if (!form.strategy_id) {
-      const strategies = strategiesQuery.data;
-      if (strategies && strategies.length > 0) {
-        setForm((prev) => ({ ...prev, strategy_id: strategies[0].strategy_id }));
+      const defaultStrategy = strategies[0];
+      setForm((prev) => ({
+        ...prev,
+        strategy_id: defaultStrategy.strategy_id,
+        strategy_params: buildDefaultStrategyParams(defaultStrategy)
+      }));
+      return;
+    }
+    if (Object.keys(form.strategy_params).length === 0) {
+      const active = strategies.find((item) => item.strategy_id === form.strategy_id);
+      if (active) {
+        setForm((prev) => ({
+          ...prev,
+          strategy_params: buildDefaultStrategyParams(active)
+        }));
       }
     }
-  }, [dataSourcesQuery, strategiesQuery.data, form.data_id, form.strategy_id]);
+  }, [strategies, form.strategy_id, form.strategy_params]);
 
   const createBacktest = useMutation({
     mutationFn: async () => {
-      await api.post("/backtests", form);
+      const { strategy_params: rawStrategyParams, ...rest } = form;
+      const active = strategies.find((item) => item.strategy_id === rest.strategy_id);
+      const normalizedParams = active
+        ? active.parameters.reduce<Record<string, number | string | boolean>>((acc, parameter) => {
+            acc[parameter.name] = coerceStrategyParameterValue(parameter, rawStrategyParams[parameter.name]);
+            return acc;
+          }, {})
+        : {};
+      await api.post("/backtests", {
+        ...rest,
+        strategy_params: normalizedParams
+      });
     },
     onSuccess: async () => {
       await client.invalidateQueries({ queryKey: ["backtests"] });
@@ -162,11 +267,11 @@ export function BacktestManagementPage() {
   });
 
   const tasks = tasksQuery.data ?? [];
-  const strategies = strategiesQuery.data ?? [];
-  const dataOptions = [
-    ...(dataSourcesQuery[0].data ?? []),
-    ...(dataSourcesQuery[1].data ?? [])
-  ];
+  const dataOptions = [...simulatedDataOptions, ...snapshotDataOptions];
+  const activeStrategy = useMemo(
+    () => strategies.find((item) => item.strategy_id === form.strategy_id),
+    [strategies, form.strategy_id]
+  );
 
   useEffect(() => {
     const activeStatuses = new Set(["running", "pending", "created"]);
@@ -252,13 +357,13 @@ export function BacktestManagementPage() {
 
   const visibleTimestamps = useMemo(() => new Set(chartData.map((point) => point.timestamp)), [chartData]);
 
-  const chartTrades = useMemo(() => {
+  const chartTrades = useMemo((): ChartTrade[] => {
     if (!selectedTask?.trades) {
       return [];
     }
     return selectedTask.trades
       .filter((trade) => visibleTimestamps.has(trade.timestamp))
-      .map((trade) => ({
+      .map((trade): ChartTrade => ({
         timestamp: trade.timestamp,
         price: trade.price,
         action: trade.action === "buy" ? "buy" : "sell"
@@ -645,7 +750,15 @@ export function BacktestManagementPage() {
               <select
                 className="w-full rounded-xl bg-slate-900/60 border border-white/10 px-3 py-2"
                 value={form.strategy_id}
-                onChange={(e) => setForm((prev) => ({ ...prev, strategy_id: e.target.value }))}
+                onChange={(e) => {
+                  const nextStrategyId = e.target.value;
+                  const nextStrategy = strategies.find((item) => item.strategy_id === nextStrategyId);
+                  setForm((prev) => ({
+                    ...prev,
+                    strategy_id: nextStrategyId,
+                    strategy_params: buildDefaultStrategyParams(nextStrategy)
+                  }));
+                }}
               >
                 {strategies.map((strategy) => (
                   <option key={strategy.strategy_id} value={strategy.strategy_id}>
@@ -711,6 +824,82 @@ export function BacktestManagementPage() {
               />
             </label>
           </div>
+        {activeStrategy && activeStrategy.parameters.length > 0 && (
+          <div className="space-y-3">
+            <h4 className="text-sm font-medium text-slate-300">策略参数</h4>
+            <div className="grid grid-cols-2 gap-4">
+              {activeStrategy.parameters.map((parameter) => {
+                const typeLower = parameter.parameter_type.toLowerCase();
+                const rawValue =
+                  form.strategy_params[parameter.name] ??
+                  (typeof parameter.default === "boolean"
+                    ? parameter.default
+                      ? "true"
+                      : "false"
+                    : parameter.default !== undefined && parameter.default !== null
+                      ? String(parameter.default)
+                      : "");
+                const value = typeof rawValue === "string" ? rawValue : String(rawValue);
+                const min = parameter.minimum ?? undefined;
+                const max = parameter.maximum ?? undefined;
+
+                if (typeLower === "bool" || typeLower === "boolean") {
+                  return (
+                    <label key={parameter.name} className="text-sm space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span>{parameter.description || parameter.name}</span>
+                        <span className="text-xs text-slate-500">{parameter.name}</span>
+                      </div>
+                      <select
+                        className="w-full rounded-xl bg-slate-900/60 border border-white/10 px-3 py-2"
+                        value={value}
+                        onChange={(e) =>
+                          setForm((prev) => ({
+                            ...prev,
+                            strategy_params: { ...prev.strategy_params, [parameter.name]: e.target.value }
+                          }))
+                        }
+                      >
+                        <option value="true">开启</option>
+                        <option value="false">关闭</option>
+                      </select>
+                    </label>
+                  );
+                }
+
+                const step = typeLower === "int" || typeLower === "integer" ? 1 : "any";
+
+                return (
+                  <label key={parameter.name} className="text-sm space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span>{parameter.description || parameter.name}</span>
+                      <span className="text-xs text-slate-500">{parameter.name}</span>
+                    </div>
+                    <input
+                      type="number"
+                      className="w-full rounded-xl bg-slate-900/60 border border-white/10 px-3 py-2"
+                      value={value}
+                      min={min}
+                      max={max}
+                      step={step}
+                      onChange={(e) =>
+                        setForm((prev) => ({
+                          ...prev,
+                          strategy_params: { ...prev.strategy_params, [parameter.name]: e.target.value }
+                        }))
+                      }
+                    />
+                    {(min !== undefined || max !== undefined) && (
+                      <p className="text-xs text-slate-500">
+                        范围：{min !== undefined ? min : "无下限"} ~ {max !== undefined ? max : "无上限"}
+                      </p>
+                    )}
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        )}
           <button
             type="submit"
             className="bg-blue-500/80 hover:bg-blue-500 transition px-5 py-2 rounded-full text-sm font-medium"

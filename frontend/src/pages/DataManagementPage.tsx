@@ -995,10 +995,10 @@ export function DataManagementPage() {
   }, [dataItems, activeFilters]);
 
   const filterOptions: { label: string; value: string }[] = [
-    { label: "SIM 数据", value: "SIM" },
-    { label: "LIVE 数据", value: "LIVE" },
-    { label: "美股 .US", value: "US" },
-    { label: "港股 .HK", value: "HK" }
+    { label: "生成数据", value: "SIM" },
+    { label: "实盘数据", value: "LIVE" },
+    { label: "美股 US", value: "US" },
+    { label: "港股 HK", value: "HK" }
   ];
 
   return (
@@ -1075,9 +1075,16 @@ export function DataManagementPage() {
                       liveTasks.map((task) => {
                         const normalizedStatus = task.status.toLowerCase();
                         const isPaused = normalizedStatus === "paused";
+                        const isWaiting = normalizedStatus === "waiting";
                         const isStopped = ["stopped", "completed", "failed"].includes(normalizedStatus);
                         const isControlPending =
                           controlLiveTask.isPending && controlLiveTask.variables?.taskId === task.task_id;
+                        const isControlDisabled = isControlPending || isWaiting;
+                        const pauseAriaLabel = isWaiting
+                          ? "等待交易时段"
+                          : isPaused
+                            ? "恢复任务"
+                            : "暂停任务";
                         return (
                           <tr
                             key={task.task_id}
@@ -1105,10 +1112,10 @@ export function DataManagementPage() {
                                         });
                                       }}
                                       className={`flex h-8 w-8 items-center justify-center rounded-full bg-blue-500/80 text-white transition hover:bg-blue-500 ${
-                                        isControlPending ? "cursor-not-allowed opacity-70" : ""
+                                        isControlDisabled ? "cursor-not-allowed opacity-70" : ""
                                       }`}
-                                      disabled={isControlPending}
-                                      aria-label={isPaused ? "恢复任务" : "暂停任务"}
+                                      disabled={isControlDisabled}
+                                      aria-label={pauseAriaLabel}
                                     >
                                       {isPaused ? <PlayIcon /> : <PauseIcon />}
                                     </button>
@@ -1186,7 +1193,7 @@ export function DataManagementPage() {
                         className={`rounded-full px-3 py-1 text-xs transition ${
                           selected
                             ? "bg-blue-500 text-white shadow-[0_0_12px_rgba(59,130,246,0.35)]"
-                            : "bg-slate-900/50 text-slate-200 hover:bg-blue-500/30 hover:text-white"
+                            : "bg-gray-800/50 text-slate-200 hover:bg-blue-500/30 hover:text-white"
                         }`}
                       >
                         {option.label}
@@ -1199,7 +1206,9 @@ export function DataManagementPage() {
                       onClick={() => setActiveFilters([])}
                       className="rounded-full bg-slate-800/60 px-3 py-1 text-xs text-slate-200 transition hover:bg-slate-700/60"
                     >
-                      重置
+                      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" className="inline-block" viewBox="0 0 16 16">
+                        <path d="M8 3a5 5 0 1 0 5 5h1.5A6.5 6.5 0 1 1 8 1.5V0l3 2.5L8 5V3z"/>
+                      </svg>
                     </button>
                   )}
                 </div>
@@ -1464,57 +1473,59 @@ export function DataManagementPage() {
                   <p className="mt-2 text-sm text-red-300/80">{activeTask.message}</p>
                 )}
               </div>
-              <div className="flex items-start gap-3">
-                <StatusBadge status={activeTask.status} />
-                <div className="flex gap-2">
-                  {activeTask.status.toLowerCase() !== "stopped" && (
-                    <button
-                      type="button"
-                      className={`flex h-8 w-8 items-center justify-center rounded-full bg-blue-500/80 text-white transition hover:bg-blue-500 ${
-                        controlLiveTask.isPending && controlLiveTask.variables?.taskId === activeTask.task_id
-                          ? "cursor-not-allowed opacity-70"
-                          : ""
-                      }`}
-                      onClick={() => {
-                        const action = activeTask.status.toLowerCase() === "paused" ? "resume" : "pause";
-                        controlLiveTask.mutate({ taskId: activeTask.task_id, action });
-                      }}
-                      disabled={
-                        controlLiveTask.isPending && controlLiveTask.variables?.taskId === activeTask.task_id
-                      }
-                      aria-label={activeTask.status.toLowerCase() === "paused" ? "恢复任务" : "暂停任务"}
-                    >
-                      {activeTask.status.toLowerCase() === "paused" ? (
-                        <PlayIcon />
-                      ) : (
-                        <PauseIcon />
+              {(() => {
+                const activeStatus = activeTask.status.toLowerCase();
+                const isPaused = activeStatus === "paused";
+                const isWaiting = activeStatus === "waiting";
+                const isStopped = activeStatus === "stopped";
+                const isControlPending =
+                  controlLiveTask.isPending && controlLiveTask.variables?.taskId === activeTask.task_id;
+                const pauseDisabled = isWaiting || isControlPending;
+                const pauseAriaLabel = isWaiting
+                  ? "等待交易时段"
+                  : isPaused
+                    ? "恢复任务"
+                    : "暂停任务";
+                return (
+                  <div className="flex items-start gap-3">
+                    <StatusBadge status={activeTask.status} />
+                    <div className="flex gap-2">
+                      {!isStopped && (
+                        <button
+                          type="button"
+                          className={`flex h-8 w-8 items-center justify-center rounded-full bg-blue-500/80 text-white transition hover:bg-blue-500 ${
+                            pauseDisabled ? "cursor-not-allowed opacity-70" : ""
+                          }`}
+                          onClick={() => {
+                            const action = isPaused ? "resume" : "pause";
+                            controlLiveTask.mutate({ taskId: activeTask.task_id, action });
+                          }}
+                          disabled={pauseDisabled}
+                          aria-label={pauseAriaLabel}
+                        >
+                          {isPaused ? <PlayIcon /> : <PauseIcon />}
+                        </button>
                       )}
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    className={`flex h-8 w-8 items-center justify-center rounded-full text-white transition ${
-                      activeTask.status.toLowerCase() === "stopped"
-                        ? "bg-red-500/80 hover:bg-red-500"
-                        : "bg-amber-500/80 hover:bg-amber-500"
-                    } ${
-                      controlLiveTask.isPending && controlLiveTask.variables?.taskId === activeTask.task_id
-                        ? "cursor-not-allowed opacity-70"
-                        : ""
-                    }`}
-                    onClick={() => {
-                      const action = activeTask.status.toLowerCase() === "stopped" ? "delete" : "stop";
-                      controlLiveTask.mutate({ taskId: activeTask.task_id, action });
-                    }}
-                    disabled={
-                      controlLiveTask.isPending && controlLiveTask.variables?.taskId === activeTask.task_id
-                    }
-                    aria-label={activeTask.status.toLowerCase() === "stopped" ? "删除任务" : "停止任务"}
-                  >
-                    {activeTask.status.toLowerCase() === "stopped" ? <TrashIcon /> : <StopIcon />}
-                  </button>
-                </div>
-              </div>
+                      <button
+                        type="button"
+                        className={`flex h-8 w-8 items-center justify-center rounded-full text-white transition ${
+                          isStopped ? "bg-red-500/80 hover:bg-red-500" : "bg-amber-500/80 hover:bg-amber-500"
+                        } ${
+                          isControlPending ? "cursor-not-allowed opacity-70" : ""
+                        }`}
+                        onClick={() => {
+                          const action = isStopped ? "delete" : "stop";
+                          controlLiveTask.mutate({ taskId: activeTask.task_id, action });
+                        }}
+                        disabled={isControlPending}
+                        aria-label={isStopped ? "删除任务" : "停止任务"}
+                      >
+                        {isStopped ? <TrashIcon /> : <StopIcon />}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
 
             <div className="grid gap-4 text-sm text-slate-300 sm:grid-cols-2">
