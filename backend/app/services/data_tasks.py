@@ -18,6 +18,7 @@ from app.models import (
     LiveDataTaskRequest,
 )
 from app.services.longport_client import LONGPORT_CLIENT, MissingCredentialsError
+from app.services.quote_utils import extract_price_and_timestamp
 from app.utils.file_storage import read_series, write_series
 from app.utils.id_generator import generate_id
 from app.utils.scheduler import SCHEDULER, TaskStatus
@@ -75,7 +76,9 @@ class DataTaskManager:
                 continue
 
             created_at = self._parse_datetime(config.get("created_at")) or _now()
-            started_at = self._parse_datetime(config.get("started_at"))
+            started_at = self._parse_datetime(config.get("started_at")) or self._parse_datetime(
+                config.get("created_at")
+            )
             finished_at = self._parse_datetime(config.get("finished_at"))
 
             status_value = config.get("status")
@@ -89,6 +92,8 @@ class DataTaskManager:
                         status_value,
                         task_id,
                     )
+            if status in {TaskStatus.RUNNING, TaskStatus.WAITING}:
+                status = TaskStatus.PAUSED
 
             state = LiveDataTaskState(
                 task_id=task_id,
@@ -207,33 +212,48 @@ class DataTaskManager:
     def _task_data_file(self, task_id: str) -> Path:
         return self.live_dir / f"{task_id}.csv"
 
-    def create_live_task(self, request: LiveDataTaskRequest) -> LiveDataTaskInfo:
-        task_id = generate_id("task_")
-        state = LiveDataTaskState(
-            task_id=task_id,
-            config=request,
-            data_file=self._task_data_file(task_id),
-        )
-        state.status = TaskStatus.RUNNING
-        self.tasks[task_id] = state
+    def _create_task_runner(self, state: LiveDataTaskState):
+        request = state.config
 
         async def runner() -> None:
-            state.started_at = _now()
+            state.started_at = state.started_at or _now()
+            state.finished_at = None
             header = ["timestamp", "price"]
-            config_payload = request.dict()
-            config_payload["task_id"] = task_id
-            config_payload["source"] = "longport_live"
-            config_payload["created_at"] = state.started_at.isoformat()
-            if request.duration_seconds is not None:
-                config_payload["duration_minutes"] = max(int(request.duration_seconds // 60), 0)
             session_definitions = resolve_sessions(request.session)
-            config_payload["dst_labels"] = get_dst_labels(session_definitions, state.started_at)
-            with state.data_file.open("w", newline="", encoding="utf-8") as fp:
-                fp.write(json.dumps(config_payload) + "\n")
-                writer = csv.DictWriter(fp, fieldnames=header)
-                writer.writeheader()
+            if not state.data_file.parent.exists():
+                state.data_file.parent.mkdir(parents=True, exist_ok=True)
 
-            end_time = _now() + timedelta(seconds=request.duration_seconds) if request.duration_seconds else None
+            if not state.data_file.exists() or state.data_file.stat().st_size == 0:
+                config_payload = request.dict()
+                config_payload["task_id"] = state.task_id
+                config_payload["source"] = config_payload.get("source", "longport_live")
+                config_payload["created_at"] = state.started_at.isoformat()
+                if request.duration_seconds is not None:
+                    config_payload["duration_minutes"] = max(int(request.duration_seconds // 60), 0)
+                config_payload["dst_labels"] = get_dst_labels(session_definitions, state.started_at)
+                if state.data_id:
+                    config_payload["data_id"] = state.data_id
+                config_payload["status"] = state.status.value
+                with state.data_file.open("w", newline="", encoding="utf-8") as fp:
+                    fp.write(json.dumps(config_payload) + "\n")
+                    writer = csv.DictWriter(fp, fieldnames=header)
+                    writer.writeheader()
+            else:
+                try:
+                    with state.data_file.open("r", encoding="utf-8") as fp:
+                        config_line = fp.readline().strip()
+                    if config_line:
+                        stored_config = json.loads(config_line)
+                        parsed_started = self._parse_datetime(stored_config.get("started_at"))
+                        if parsed_started:
+                            state.started_at = parsed_started
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("Failed to read config for task %s: %s", state.task_id, exc)
+
+            if request.duration_seconds is not None and state.started_at is not None:
+                end_time = state.started_at + timedelta(seconds=request.duration_seconds)
+            else:
+                end_time = None
             pause_started: Optional[datetime] = None
             waiting_started: Optional[datetime] = None
             try:
@@ -249,14 +269,14 @@ class DataTaskManager:
                             waiting_started = now
                         if state.status != TaskStatus.WAITING:
                             state.status = TaskStatus.WAITING
-                            scheduler_task = SCHEDULER.get(task_id)
+                            scheduler_task = SCHEDULER.get(state.task_id)
                             if scheduler_task is not None:
                                 scheduler_task.status = TaskStatus.WAITING
                         await asyncio.sleep(1.0)
                         continue
                     if state.status == TaskStatus.WAITING:
                         state.status = TaskStatus.RUNNING
-                        scheduler_task = SCHEDULER.get(task_id)
+                        scheduler_task = SCHEDULER.get(state.task_id)
                         if scheduler_task is not None:
                             scheduler_task.status = TaskStatus.RUNNING
                     if waiting_started is not None:
@@ -269,8 +289,11 @@ class DataTaskManager:
                         pause_started = None
                     if end_time is not None and now >= end_time:
                         break
-                    price = await self._fetch_symbol_price(request.symbol, request.account_mode)
-                    row = {"timestamp": _now().isoformat(), "price": price}
+                    price, price_timestamp = await self._fetch_symbol_price(
+                        request.symbol, request.account_mode, request.session
+                    )
+                    timestamp = price_timestamp or _now()
+                    row = {"timestamp": timestamp.isoformat(), "price": price}
                     with state.data_file.open("a", newline="", encoding="utf-8") as fp:
                         writer = csv.DictWriter(fp, fieldnames=header)
                         writer.writerow(row)
@@ -288,20 +311,30 @@ class DataTaskManager:
             finally:
                 state.finished_at = _now()
 
-        SCHEDULER.create(task_id, runner)
+        return runner
+
+    def create_live_task(self, request: LiveDataTaskRequest) -> LiveDataTaskInfo:
+        task_id = generate_id("task_")
+        state = LiveDataTaskState(
+            task_id=task_id,
+            config=request,
+            data_file=self._task_data_file(task_id),
+        )
+        state.status = TaskStatus.RUNNING
+        self.tasks[task_id] = state
+
+        SCHEDULER.create(task_id, self._create_task_runner(state))
         return self.describe_live_task(task_id)
 
-    async def _fetch_symbol_price(self, symbol: str, mode: str) -> float:
-        def fetch() -> float:
+    async def _fetch_symbol_price(self, symbol: str, mode: str, session: str) -> tuple[float, datetime]:
+        def fetch() -> tuple[float, datetime]:
             with LONGPORT_CLIENT.quote_context(mode) as ctx:
                 response = ctx.quote([symbol])
                 if not response:
                     raise RuntimeError("Quote response empty")
                 quote = response[0]
-                price = getattr(quote, "last_done", None)
-                if price is None:
-                    raise RuntimeError("Quote has no last_done price")
-                return float(price)
+                price, timestamp = extract_price_and_timestamp(quote, session)
+                return price, timestamp or _now()
 
         try:
             return await asyncio.to_thread(fetch)
@@ -309,7 +342,10 @@ class DataTaskManager:
             raise
         except Exception:
             # fallback to pseudo-random walk to keep task running in dev
-            return round(100 + (hash(symbol) % 100) * 0.01, 4)
+            return (
+                round(100 + (hash(symbol) % 100) * 0.01, 4),
+                _now(),
+            )
 
     def create_snapshot(
         self,
@@ -433,8 +469,19 @@ class DataTaskManager:
     def resume_task(self, task_id: str) -> LiveDataTaskInfo:
         state = self.tasks[task_id]
         state.status = TaskStatus.RUNNING
+        state.message = None
+        if state.finished_at is not None:
+            state.finished_at = None
         scheduler_task = SCHEDULER.get(task_id)
-        if scheduler_task is not None:
+        if scheduler_task is None or scheduler_task.status in {
+            TaskStatus.STOPPED,
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+        }:
+            if scheduler_task is not None:
+                SCHEDULER.remove(task_id)
+            SCHEDULER.create(task_id, self._create_task_runner(state))
+        else:
             scheduler_task.status = TaskStatus.RUNNING
         return self.describe_live_task(task_id)
 

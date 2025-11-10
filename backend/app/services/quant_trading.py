@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 from app.config import CONFIG
 from app.models import QuantTaskInfo, QuantTaskRequest, SignalType, StrategySignal
 from app.services.longport_client import LONGPORT_CLIENT, MissingCredentialsError
+from app.services.quote_utils import extract_price_and_timestamp
 from app.services.strategies.base import STRATEGY_REGISTRY, Strategy
 from app.utils.id_generator import generate_id
 from app.utils.scheduler import SCHEDULER, TaskStatus
@@ -80,8 +81,11 @@ class QuantTradingManager:
 
         try:
             while True:
-                price = await self._fetch_symbol_price(request.symbol, request.account_mode)
-                timestamp = _now().isoformat()
+                price, price_timestamp = await self._fetch_symbol_price(
+                    request.symbol, request.account_mode, request.session
+                )
+                timestamp_dt = price_timestamp or _now()
+                timestamp = timestamp_dt.isoformat()
                 last_price = price
                 signal: StrategySignal = strategy.generate_signal(price, _now())
 
@@ -185,17 +189,15 @@ class QuantTradingManager:
         except Exception:
             return 0.0
 
-    async def _fetch_symbol_price(self, symbol: str, mode: str) -> float:
-        def fetch() -> float:
+    async def _fetch_symbol_price(self, symbol: str, mode: str, session: str) -> tuple[float, datetime]:
+        def fetch() -> tuple[float, datetime]:
             with LONGPORT_CLIENT.quote_context(mode) as ctx:
                 quotes = ctx.quote([symbol])
                 if quotes:
                     quote = quotes[0]
-                    if getattr(quote, "last_done", None) and getattr(quote.last_done, "price", None):
-                        return float(quote.last_done.price)
-                    if getattr(quote, "last", None) is not None:
-                        return float(quote.last)
-                raise RuntimeError("Unable to fetch price for symbol.")
+                    price, timestamp = extract_price_and_timestamp(quote, session)
+                    return price, timestamp or _now()
+                raise RuntimeError("Quote response empty.")
 
         try:
             return await asyncio.to_thread(fetch)
