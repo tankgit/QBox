@@ -77,11 +77,24 @@ class MovingAverageStrategy(Strategy):
             signal = SignalType.SELL
             strength = normalized_strength
 
+        # 检查是否发生交叉，如果发生交叉，强制设置信号并确保强度不为0
         if self._previous_spread is not None:
             if spread > 0 >= self._previous_spread:
+                # 从负变正，买入信号
                 signal = SignalType.BUY
+                # 使用normalized_strength，但如果太小，至少使用min_strength
+                if abs(normalized_strength) < self.min_strength:
+                    strength = self.min_strength
+                else:
+                    strength = normalized_strength
             elif spread < 0 <= self._previous_spread:
+                # 从正变负，卖出信号
                 signal = SignalType.SELL
+                # 使用normalized_strength，但如果太小，至少使用min_strength（取负值）
+                if abs(normalized_strength) < self.min_strength:
+                    strength = -self.min_strength
+                else:
+                    strength = normalized_strength
 
         self._previous_spread = spread
 

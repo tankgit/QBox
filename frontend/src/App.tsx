@@ -158,7 +158,7 @@ export default function App() {
       </aside>
 
       <main className="relative z-10 ml-[22rem] mr-8 py-12">
-        <div className="glass-panel content-shell px-12 py-12 min-h-[calc(100vh-6rem)]">
+        <div className="glass-panel content-shell px-12 py-12 h-[calc(100vh-6rem)] flex flex-col overflow-hidden">
           <Routes>
             <Route path="/" element={<DataManagementPage />} />
             <Route path="/data/*" element={<DataManagementPage />} />

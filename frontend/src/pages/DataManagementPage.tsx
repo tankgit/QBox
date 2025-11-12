@@ -1002,8 +1002,8 @@ export function DataManagementPage() {
   ];
 
   return (
-    <div className="space-y-10">
-      <header className="flex items-center justify-between">
+    <div className="flex flex-col h-full overflow-hidden">
+      <header className="flex items-center justify-between flex-shrink-0 px-6 py-4">
         <div>
           <h2 className="text-3xl font-semibold">数据管理</h2>
           <p className="text-slate-400 mt-2">实时数据与模拟数据统一管理，支持任务监控与快照。</p>
@@ -1014,8 +1014,8 @@ export function DataManagementPage() {
         </div>
       </header>
 
-      <section>
-        <div className="flex gap-4 mb-6">
+      <section className="flex-1 flex flex-col overflow-hidden px-6 pb-6">
+        <div className="flex gap-4 mb-6 flex-shrink-0">
           <button
             type="button"
             onClick={() => setActiveTab("live")}
@@ -1037,8 +1037,8 @@ export function DataManagementPage() {
         </div>
 
         {activeTab === "live" ? (
-          <div className="space-y-8">
-            <div className="flex items-center justify-between">
+          <div className="flex-1 flex flex-col overflow-hidden gap-8 min-h-0">
+            <div className="flex items-center justify-between flex-shrink-0">
               <h3 className="text-xl font-semibold">实时爬取任务</h3>
               <button
                 type="button"
@@ -1049,8 +1049,8 @@ export function DataManagementPage() {
               </button>
             </div>
 
-            <div className="glass-panel rounded-3xl border border-white/5 overflow-hidden">
-              <div className="overflow-x-auto">
+            <div className="glass-panel rounded-3xl border border-white/5 overflow-hidden flex flex-col h-fit max-h-full">
+              <div className="overflow-auto max-h-full">
                 <table className="w-full min-w-[900px] text-sm">
                   <thead className="bg-white/5 text-slate-300">
                     <tr className="text-left">
@@ -1166,9 +1166,9 @@ export function DataManagementPage() {
             </div>
           </div>
         ) : (
-          <div className="grid gap-6 xl:grid-cols-[minmax(280px,20%)_minmax(0,80%)] items-start">
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
+          <div className="flex-1 grid gap-6 xl:grid-cols-[minmax(280px,20%)_minmax(0,80%)] overflow-hidden min-h-0">
+            <div className="flex flex-col overflow-hidden gap-4 min-h-0">
+              <div className="flex items-center justify-between flex-shrink-0">
                 <h3 className="text-xl font-semibold">数据系列</h3>
                 <button
                   type="button"
@@ -1181,7 +1181,7 @@ export function DataManagementPage() {
                   创建数据
                 </button>
               </div>
-              <div className="space-y-3 max-h-[100vh] overflow-y-auto p-2">
+              <div className="flex-1 overflow-y-auto space-y-3 p-2">
                 <div className="flex flex-wrap gap-2 pb-2">
                   {filterOptions.map((option: { label: string; value: string }) => {
                     const selected = activeFilters.includes(option.value);
@@ -1280,7 +1280,7 @@ export function DataManagementPage() {
                 )}
               </div>
             </div>
-            <div className="glass-panel p-6 rounded-3xl border border-white/5 space-y-6 min-h-[520px] max-h-[100vh] overflow-y-auto pr-3 xl:w-full">
+            <div className="glass-panel p-6 rounded-3xl border border-white/5 gap-6 overflow-y-auto pr-3 xl:w-full flex flex-col min-h-0">
               {selectedData ? (
                 isDetailLoading ? (
                   <div className="flex h-full min-h-[320px] items-center justify-center text-slate-500">加载中...</div>

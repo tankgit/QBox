@@ -55,6 +55,7 @@ class DataTaskManager:
         self.snapshots_dir.mkdir(parents=True, exist_ok=True)
         self.live_dir.mkdir(parents=True, exist_ok=True)
         self._load_existing_live_tasks()
+        self._load_existing_snapshots()
 
     def _load_existing_live_tasks(self) -> None:
         for file_path in sorted(self.live_dir.glob("task_*.csv")):
@@ -107,6 +108,60 @@ class DataTaskManager:
                 data_id=config.get("data_id"),
             )
             self.tasks[task_id] = state
+
+    def _load_existing_snapshots(self) -> None:
+        """Load existing snapshot files from disk on service startup."""
+        for file_path in sorted(self.snapshots_dir.glob("data_*.csv")):
+            try:
+                stored = read_series(file_path)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Failed to read snapshot file %s: %s", file_path, exc)
+                continue
+
+            config = stored.config or {}
+            data_id = file_path.stem  # Extract data_id from filename (e.g., "data_4yhvh9vl")
+            task_id = config.get("task_id")
+            
+            if not task_id:
+                LOGGER.warning("Snapshot file %s missing task_id, skipping", file_path)
+                continue
+
+            # Get or generate snapshot_id
+            snapshot_id = config.get("snapshot_id")
+            if not snapshot_id:
+                # Generate a new snapshot_id for old snapshots that don't have one
+                snapshot_id = generate_id("snap_")
+                # Update the file to include snapshot_id for future loads
+                try:
+                    config["snapshot_id"] = snapshot_id
+                    write_series(file_path, config, stored.rows)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("Failed to update snapshot file %s with snapshot_id: %s", file_path, exc)
+
+            # Parse created_at
+            created_at_str = config.get("created_at")
+            created_at = _now()
+            if isinstance(created_at_str, str):
+                parsed = self._parse_datetime(created_at_str)
+                if parsed:
+                    created_at = parsed
+                else:
+                    # Fallback to file modification time
+                    try:
+                        created_at = datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            snapshot = LiveDataSnapshotInfo(
+                snapshot_id=snapshot_id,
+                task_id=str(task_id),
+                data_id=data_id,
+                created_at=created_at,
+                path=str(file_path),
+            )
+            self.snapshots[snapshot_id] = snapshot
 
     @staticmethod
     def _parse_datetime(value: Any) -> Optional[datetime]:
@@ -375,11 +430,13 @@ class DataTaskManager:
         snapshot_config["created_at"] = _now().isoformat()
 
         data_id = generate_id("data_")
+        snapshot_id = generate_id("snap_")
+        snapshot_config["snapshot_id"] = snapshot_id  # Save snapshot_id to file for persistence
         snapshot_path = self.snapshots_dir / f"{data_id}.csv"
         write_series(snapshot_path, snapshot_config, sliced_rows)
 
         snapshot = LiveDataSnapshotInfo(
-            snapshot_id=generate_id("snap_"),
+            snapshot_id=snapshot_id,
             task_id=task_id,
             data_id=data_id,
             created_at=_now(),
@@ -412,7 +469,30 @@ class DataTaskManager:
             if state.data_id == data_id:
                 state.data_id = None
     def list_snapshots(self) -> List[LiveDataSnapshotInfo]:
-        return list(self.snapshots.values())
+        result = []
+        for snapshot in self.snapshots.values():
+            data_points = None
+            symbol = None
+            snapshot_path = Path(snapshot.path)
+            if snapshot_path.exists():
+                try:
+                    stored = read_series(snapshot_path)
+                    data_points = len(stored.rows)
+                    symbol = stored.config.get("symbol", "unknown")
+                except Exception:  # noqa: BLE001
+                    pass
+            result.append(
+                LiveDataSnapshotInfo(
+                    snapshot_id=snapshot.snapshot_id,
+                    task_id=snapshot.task_id,
+                    data_id=snapshot.data_id,
+                    created_at=snapshot.created_at,
+                    path=snapshot.path,
+                    data_points=data_points,
+                    symbol=symbol,
+                )
+            )
+        return result
 
     def get_data_series(self, data_id: str) -> DataSeriesDetail:
         path = self.snapshots_dir / f"{data_id}.csv"

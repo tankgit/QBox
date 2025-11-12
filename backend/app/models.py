@@ -48,6 +48,7 @@ class DataSeriesInfo(BaseModel):
     source: str
     path: str
     config: Dict[str, Any]
+    data_points: Optional[int] = None
 
 
 class DataSeriesDetail(DataSeriesInfo):
@@ -113,6 +114,8 @@ class LiveDataSnapshotInfo(BaseModel):
     data_id: str
     created_at: datetime
     path: str
+    data_points: Optional[int] = None
+    symbol: Optional[str] = None
 
 
 class StrategyParameter(BaseModel):
@@ -131,6 +134,11 @@ class StrategyMetadata(BaseModel):
     parameters: List[StrategyParameter]
 
 
+class CommissionType(str, Enum):
+    FIXED = "fixed"
+    RATIO = "ratio"
+
+
 class BacktestRequest(BaseModel):
     data_id: str
     strategy_id: str
@@ -141,6 +149,9 @@ class BacktestRequest(BaseModel):
     lot_size: float = Field(default=1.0, gt=0)
     data_frequency_seconds: int = Field(default=60, ge=1)
     signal_frequency_seconds: int = Field(default=60, ge=1)
+    commission_type: CommissionType = Field(default=CommissionType.FIXED)
+    commission_value: float = Field(default=0.0, ge=0)
+    commission_max: Optional[float] = Field(default=None, ge=0)
 
 
 class BacktestTaskInfo(BaseModel):

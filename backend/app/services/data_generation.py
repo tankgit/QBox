@@ -103,6 +103,7 @@ class DataRepository:
                     source=stored.config.get("source", "unknown"),
                     path=str(file),
                     config=stored.config,
+                    data_points=len(stored.rows),
                 )
             )
         return items

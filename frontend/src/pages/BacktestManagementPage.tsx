@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import api from "../api/client";
 import { Dialog } from "../components/Dialog";
@@ -26,6 +26,7 @@ interface BacktestTask {
   metrics?: Record<string, number>;
   config: {
     data_id: string;
+    data_symbol?: string;
     strategy_id: string;
     initial_capital: number;
   };
@@ -110,6 +111,7 @@ const coerceStrategyParameterValue = (parameter: StrategyParameter, rawValue: st
 interface DataItem {
   data_id: string;
   symbol: string;
+  data_points?: number;
 }
 
 interface DataDetail {
@@ -134,6 +136,7 @@ export function BacktestManagementPage() {
     field: "created_at",
     direction: "desc"
   });
+  const [selectedTags, setSelectedTags] = useState<Set<string>>(new Set());
   const [form, setForm] = useState({
     data_id: "",
     strategy_id: "",
@@ -143,8 +146,17 @@ export function BacktestManagementPage() {
     max_position: 1,
     data_frequency_seconds: 60,
     signal_frequency_seconds: 60,
+    commission_type: "fixed" as "fixed" | "ratio",
+    commission_value: 0,
+    commission_max: undefined as number | undefined,
     strategy_params: {} as Record<string, string>
   });
+  const [dataSearchInput, setDataSearchInput] = useState("");
+  const [isDataDropdownOpen, setIsDataDropdownOpen] = useState(false);
+  const dataDropdownRef = useRef<HTMLDivElement>(null);
+  const [strategySearchInput, setStrategySearchInput] = useState("");
+  const [isStrategyDropdownOpen, setIsStrategyDropdownOpen] = useState(false);
+  const strategyDropdownRef = useRef<HTMLDivElement>(null);
 
   const tasksQuery = useQuery({
     queryKey: ["backtests"],
@@ -174,8 +186,8 @@ export function BacktestManagementPage() {
       {
         queryKey: ["liveSnapshots"],
         queryFn: async () => {
-          const { data } = await api.get<Array<{ data_id: string; task_id: string }>>("/data/live/snapshots");
-          return data.map((item) => ({ data_id: item.data_id, symbol: item.task_id }));
+          const { data } = await api.get<Array<{ data_id: string; task_id: string; data_points?: number; symbol?: string }>>("/data/live/snapshots");
+          return data.map((item) => ({ data_id: item.data_id, symbol: item.symbol || "unknown", data_points: item.data_points }));
         }
       }
     ]
@@ -217,7 +229,7 @@ export function BacktestManagementPage() {
 
   const createBacktest = useMutation({
     mutationFn: async () => {
-      const { strategy_params: rawStrategyParams, ...rest } = form;
+      const { strategy_params: rawStrategyParams, commission_max, ...rest } = form;
       const active = strategies.find((item) => item.strategy_id === rest.strategy_id);
       const normalizedParams = active
         ? active.parameters.reduce<Record<string, number | string | boolean>>((acc, parameter) => {
@@ -227,6 +239,7 @@ export function BacktestManagementPage() {
         : {};
       await api.post("/backtests", {
         ...rest,
+        commission_max: commission_max ?? null,
         strategy_params: normalizedParams
       });
     },
@@ -246,6 +259,12 @@ export function BacktestManagementPage() {
     },
     onSuccess: async () => {
       await client.invalidateQueries({ queryKey: ["backtests"] });
+    },
+    onError: async (error: any) => {
+      // 如果任务不存在（404），强制刷新列表以移除已删除的任务
+      if (error?.response?.status === 404) {
+        await client.invalidateQueries({ queryKey: ["backtests"] });
+      }
     }
   });
 
@@ -273,6 +292,70 @@ export function BacktestManagementPage() {
     [strategies, form.strategy_id]
   );
 
+  // 过滤数据选项
+  const filteredDataOptions = useMemo(() => {
+    if (!dataSearchInput.trim()) {
+      return dataOptions;
+    }
+    const searchLower = dataSearchInput.toLowerCase();
+    return dataOptions.filter((option) => {
+      const symbolMatch = option.symbol.toLowerCase().includes(searchLower);
+      const dataIdMatch = option.data_id.toLowerCase().includes(searchLower);
+      return symbolMatch || dataIdMatch;
+    });
+  }, [dataOptions, dataSearchInput]);
+
+  // 获取当前选中的数据项的显示文本
+  const selectedDataDisplayText = useMemo(() => {
+    const selected = dataOptions.find((opt) => opt.data_id === form.data_id);
+    if (!selected) {
+      return "";
+    }
+    const dataPointsText = selected.data_points !== undefined ? selected.data_points.toLocaleString() : "未知";
+    return `${selected.symbol} (${dataPointsText} 个数据)`;
+  }, [dataOptions, form.data_id]);
+
+  // 过滤策略选项
+  const filteredStrategyOptions = useMemo(() => {
+    if (!strategySearchInput.trim()) {
+      return strategies;
+    }
+    const searchLower = strategySearchInput.toLowerCase();
+    return strategies.filter((strategy) => {
+      const nameMatch = strategy.name.toLowerCase().includes(searchLower);
+      const idMatch = strategy.strategy_id.toLowerCase().includes(searchLower);
+      return nameMatch || idMatch;
+    });
+  }, [strategies, strategySearchInput]);
+
+  // 获取当前选中的策略项的显示文本
+  const selectedStrategyDisplayText = useMemo(() => {
+    const selected = strategies.find((strategy) => strategy.strategy_id === form.strategy_id);
+    if (!selected) {
+      return "";
+    }
+    return selected.name;
+  }, [strategies, form.strategy_id]);
+
+  // 点击外部关闭下拉列表
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (dataDropdownRef.current && !dataDropdownRef.current.contains(event.target as Node)) {
+        setIsDataDropdownOpen(false);
+      }
+      if (strategyDropdownRef.current && !strategyDropdownRef.current.contains(event.target as Node)) {
+        setIsStrategyDropdownOpen(false);
+      }
+    };
+
+    if (isDataDropdownOpen || isStrategyDropdownOpen) {
+      document.addEventListener("mousedown", handleClickOutside);
+      return () => {
+        document.removeEventListener("mousedown", handleClickOutside);
+      };
+    }
+  }, [isDataDropdownOpen, isStrategyDropdownOpen]);
+
   useEffect(() => {
     const activeStatuses = new Set(["running", "pending", "created"]);
     const hasActive = tasks.some((task) => activeStatuses.has(task.status.toLowerCase()));
@@ -287,7 +370,137 @@ export function BacktestManagementPage() {
     };
   }, [tasks, tasksQuery]);
 
-  const sortedTasks = tasks.slice().sort((a, b) => {
+  // 获取所有可用的筛选tags，分类为3个区域
+  const categorizedTags = useMemo(() => {
+    const dataTypeTags: string[] = [];
+    const strategyTags: string[] = [];
+    const profitTags: string[] = [];
+    
+    // 市场类型tags
+    const hasUS = tasks.some((task) => {
+      const symbol = task.config.data_symbol || "";
+      return symbol.endsWith(".US");
+    });
+    const hasHK = tasks.some((task) => {
+      const symbol = task.config.data_symbol || "";
+      return symbol.endsWith(".HK");
+    });
+    if (hasUS) dataTypeTags.push("美股");
+    if (hasHK) dataTypeTags.push("港股");
+    
+    // 数据来源tags
+    const hasSimulated = tasks.some((task) => {
+      return simulatedDataOptions.some((data) => data.data_id === task.config.data_id);
+    });
+    if (hasSimulated) dataTypeTags.push("模拟数据");
+    
+    // 策略名tags
+    strategies.forEach((strategy) => {
+      if (tasks.some((task) => task.config.strategy_id === strategy.strategy_id)) {
+        strategyTags.push(strategy.name);
+      }
+    });
+    strategyTags.sort();
+    
+    // 收益方向tags
+    const hasPositive = tasks.some((task) => {
+      const totalReturn = task.metrics?.total_return;
+      return typeof totalReturn === "number" && totalReturn >= 0;
+    });
+    const hasNegative = tasks.some((task) => {
+      const totalReturn = task.metrics?.total_return;
+      return typeof totalReturn === "number" && totalReturn < 0;
+    });
+    if (hasPositive) profitTags.push("正向收益");
+    if (hasNegative) profitTags.push("负向收益");
+    
+    return { dataTypeTags, strategyTags, profitTags };
+  }, [tasks, simulatedDataOptions, strategies]);
+
+  // 获取tag的选中颜色样式
+  const getTagColorClass = (tag: string, isSelected: boolean) => {
+    if (!isSelected) {
+      return "bg-slate-800/60 text-slate-300 hover:bg-slate-700/60";
+    }
+    
+    // 第一块：数据类型
+    if (tag === "美股") {
+      return "bg-orange-500/80 text-white hover:bg-orange-500";
+    }
+    if (tag === "港股") {
+      return "bg-purple-500/80 text-white hover:bg-purple-500";
+    }
+    if (tag === "模拟数据") {
+      return "bg-blue-500/80 text-white hover:bg-blue-500";
+    }
+    
+    // 第二块：策略（灰白色）
+    if (categorizedTags.strategyTags.includes(tag)) {
+      return "bg-slate-200/80 text-slate-900 hover:bg-slate-200";
+    }
+    
+    // 第三块：盈利相关
+    if (tag === "正向收益") {
+      return "bg-red-500/80 text-white hover:bg-red-500";
+    }
+    if (tag === "负向收益") {
+      return "bg-green-500/80 text-white hover:bg-green-500";
+    }
+    
+    // 默认
+    return "bg-blue-500/80 text-white hover:bg-blue-500";
+  };
+
+  // 筛选任务
+  const filteredTasks = useMemo(() => {
+    if (selectedTags.size === 0) {
+      return tasks;
+    }
+    
+    return tasks.filter((task) => {
+      const taskTags = new Set<string>();
+      
+      // 市场类型
+      const symbol = task.config.data_symbol || "";
+      if (symbol.endsWith(".US")) {
+        taskTags.add("美股");
+      } else if (symbol.endsWith(".HK")) {
+        taskTags.add("港股");
+      }
+      
+      // 数据来源
+      const isSimulated = simulatedDataOptions.some((data) => data.data_id === task.config.data_id);
+      if (isSimulated) {
+        taskTags.add("模拟数据");
+      }
+      
+      // 策略名
+      const strategy = strategies.find((s) => s.strategy_id === task.config.strategy_id);
+      if (strategy) {
+        taskTags.add(strategy.name);
+      }
+      
+      // 收益方向
+      const totalReturn = task.metrics?.total_return;
+      if (typeof totalReturn === "number") {
+        if (totalReturn >= 0) {
+          taskTags.add("正向收益");
+        } else {
+          taskTags.add("负向收益");
+        }
+      }
+      
+      // 检查是否匹配任意一个选中的tag（并集）
+      for (const tag of selectedTags) {
+        if (taskTags.has(tag)) {
+          return true;
+        }
+      }
+      return false;
+    });
+  }, [tasks, selectedTags, simulatedDataOptions, strategies]);
+
+  const sortedTasks = filteredTasks.slice().sort((a, b) => {
     const { field, direction } = sortConfig;
     const multiplier = direction === "asc" ? 1 : -1;
 
@@ -315,6 +528,18 @@ export function BacktestManagementPage() {
 
     return String(valueA).localeCompare(String(valueB)) * multiplier;
   });
+
+  const toggleTag = (tag: string) => {
+    setSelectedTags((prev) => {
+      const next = new Set(prev);
+      if (next.has(tag)) {
+        next.delete(tag);
+      } else {
+        next.add(tag);
+      }
+      return next;
+    });
+  };
 
   const toggleSort = (field: typeof sortConfig.field) => {
     setSortConfig((prev) => {
@@ -600,10 +825,95 @@ export function BacktestManagementPage() {
       </header>
 
       <section className="space-y-4">
+        {/* 筛选Tags */}
+        {(categorizedTags.dataTypeTags.length > 0 || categorizedTags.strategyTags.length > 0 || categorizedTags.profitTags.length > 0) && (
+          <div className="flex flex-wrap items-center gap-2">
+              {/* 第一块：数据类型 */}
+              {categorizedTags.dataTypeTags.length > 0 && (
+                <>
+                  <div className="flex flex-wrap gap-2 items-center">
+                    {categorizedTags.dataTypeTags.map((tag) => {
+                      const isSelected = selectedTags.has(tag);
+                      return (
+                        <button
+                          key={tag}
+                          type="button"
+                          onClick={() => toggleTag(tag)}
+                          className={`px-4 py-2 rounded-full text-sm font-medium transition ${getTagColorClass(tag, isSelected)}`}
+                        >
+                          {tag}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {(categorizedTags.strategyTags.length > 0 || categorizedTags.profitTags.length > 0) && (
+                    <div className="h-6 w-px bg-white/20 mx-1" />
+                  )}
+                </>
+              )}
+              
+              {/* 第二块：策略 */}
+              {categorizedTags.strategyTags.length > 0 && (
+                <>
+                  <div className="flex flex-wrap gap-2 items-center">
+                    {categorizedTags.strategyTags.map((tag) => {
+                      const isSelected = selectedTags.has(tag);
+                      return (
+                        <button
+                          key={tag}
+                          type="button"
+                          onClick={() => toggleTag(tag)}
+                          className={`px-4 py-2 rounded-full text-sm font-medium transition ${getTagColorClass(tag, isSelected)}`}
+                        >
+                          {tag}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {categorizedTags.profitTags.length > 0 && (
+                    <div className="h-6 w-px bg-white/20 mx-1" />
+                  )}
+                </>
+              )}
+              
+              {/* 第三块：盈利相关 */}
+              {categorizedTags.profitTags.length > 0 && (
+                <div className="flex flex-wrap gap-2 items-center">
+                  {categorizedTags.profitTags.map((tag) => {
+                    const isSelected = selectedTags.has(tag);
+                    return (
+                      <button
+                        key={tag}
+                        type="button"
+                        onClick={() => toggleTag(tag)}
+                        className={`px-4 py-2 rounded-full text-sm font-medium transition ${getTagColorClass(tag, isSelected)}`}
+                      >
+                        {tag}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              
+              {/* 清除筛选按钮 */}
+              {selectedTags.size > 0 && (
+                <>
+                  <div className="h-6 w-px bg-white/20 mx-1" />
+                  <button
+                    type="button"
+                    onClick={() => setSelectedTags(new Set())}
+                    className="px-4 py-2 rounded-full text-sm font-medium bg-slate-800/60 text-slate-400 hover:bg-slate-700/60 transition"
+                  >
+                    清除筛选
+                  </button>
+                </>
+              )}
+            </div>
+        )}
         <div className="glass-panel border border-white/5 rounded-3xl overflow-hidden">
-          <div className="overflow-x-auto">
+          <div className="overflow-x-auto max-h-[calc(100vh-300px)] overflow-y-auto">
             <table className="min-w-full divide-y divide-white/5 text-sm text-slate-200">
-              <thead className="bg-slate-900/40 text-xs uppercase tracking-wider text-slate-400">
+              <thead className="bg-slate-900/95 backdrop-blur-sm text-xs uppercase tracking-wider text-slate-400 sticky top-0 z-10">
                 <tr>
                   <th className="px-6 py-4 text-left">
                     <button type="button" className="flex items-center gap-1 hover:text-slate-200 transition" onClick={() => toggleSort("task_id")}>
@@ -611,6 +921,7 @@ export function BacktestManagementPage() {
                       <span className="text-slate-500 text-[10px]">{getSortIndicator("task_id")}</span>
                     </button>
                   </th>
+                  <th className="px-4 py-4 text-left">数据</th>
                   <th className="px-4 py-4 text-left">策略</th>
                   <th className="px-4 py-4 text-left">状态</th>
                   <th className="px-4 py-4 text-left">
@@ -651,6 +962,12 @@ export function BacktestManagementPage() {
                         <div className="flex flex-col gap-1">
                           <span className="text-white/90">{task.task_id}</span>
                           {task.message && <span className="text-xs text-amber-300/80">{task.message}</span>}
+                        </div>
+                      </td>
+                      <td className="px-4 py-5 align-top">
+                        <div className="flex flex-col gap-1">
+                          <span className="text-slate-300">{task.config.data_symbol || "unknown"}</span>
+                          <span className="text-xs text-slate-500">{task.config.data_id}</span>
                         </div>
                       </td>
                       <td className="px-4 py-5 align-top text-slate-400">{task.config.strategy_id}</td>
@@ -711,7 +1028,7 @@ export function BacktestManagementPage() {
                 })}
                 {sortedTasks.length === 0 && (
                   <tr>
-                    <td colSpan={7} className="px-6 py-12 text-center text-slate-500">
+                    <td colSpan={8} className="px-6 py-12 text-center text-slate-500">
                       暂无回测任务。
                     </td>
                   </tr>
@@ -733,39 +1050,163 @@ export function BacktestManagementPage() {
           <div className="grid grid-cols-2 gap-4">
             <label className="text-sm space-y-2">
               数据源
-              <select
-                className="w-full rounded-xl bg-slate-900/60 border border-white/10 px-3 py-2"
-                value={form.data_id}
-                onChange={(e) => setForm((prev) => ({ ...prev, data_id: e.target.value }))}
-              >
-                {dataOptions.map((option) => (
-                  <option key={option.data_id} value={option.data_id}>
-                    {option.data_id}
-                  </option>
-                ))}
-              </select>
+              <div className="relative" ref={dataDropdownRef}>
+                <input
+                  type="text"
+                  className="w-full rounded-xl bg-slate-900/60 border border-white/10 px-3 py-2 pr-8"
+                  value={isDataDropdownOpen ? dataSearchInput : selectedDataDisplayText}
+                  onChange={(e) => {
+                    setDataSearchInput(e.target.value);
+                    setIsDataDropdownOpen(true);
+                  }}
+                  onFocus={() => {
+                    setIsDataDropdownOpen(true);
+                    if (!dataSearchInput && selectedDataDisplayText) {
+                      setDataSearchInput("");
+                    }
+                  }}
+                  onBlur={(e) => {
+                    // 延迟关闭，以便点击选项时能触发
+                    setTimeout(() => {
+                      if (!e.relatedTarget || !dataDropdownRef.current?.contains(e.relatedTarget as Node)) {
+                        setIsDataDropdownOpen(false);
+                        setDataSearchInput("");
+                      }
+                    }, 200);
+                  }}
+                  placeholder={isDataDropdownOpen ? "搜索symbol或data_id..." : "选择数据源"}
+                />
+                <button
+                  type="button"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200"
+                  onClick={() => setIsDataDropdownOpen(!isDataDropdownOpen)}
+                >
+                  <svg
+                    className={`w-4 h-4 transition-transform ${isDataDropdownOpen ? "rotate-180" : ""}`}
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                  </svg>
+                </button>
+                {isDataDropdownOpen && (
+                  <div className="absolute z-50 w-full mt-1 max-h-60 overflow-auto rounded-xl bg-slate-900/95 border border-white/10 shadow-lg">
+                    {filteredDataOptions.length > 0 ? (
+                      filteredDataOptions.map((option) => {
+                        const dataPointsText = option.data_points !== undefined ? option.data_points.toLocaleString() : "未知";
+                        return (
+                          <button
+                            key={option.data_id}
+                            type="button"
+                            className="w-full text-left px-3 py-2 hover:bg-slate-800/60 transition text-sm"
+                            onMouseDown={(e) => {
+                              e.preventDefault(); // 防止onBlur先触发
+                            }}
+                            onClick={() => {
+                              setForm((prev) => ({ ...prev, data_id: option.data_id }));
+                              setDataSearchInput("");
+                              setIsDataDropdownOpen(false);
+                            }}
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="flex-1 min-w-0">
+                                <div className="text-slate-200 font-medium truncate">{option.symbol}</div>
+                                <div className="text-xs text-slate-500 truncate mt-0.5">{option.data_id}</div>
+                              </div>
+                              <div className="text-xs text-slate-400 whitespace-nowrap flex-shrink-0">
+                                {dataPointsText} 个数据
+                              </div>
+                            </div>
+                          </button>
+                        );
+                      })
+                    ) : (
+                      <div className="px-3 py-2 text-sm text-slate-400">未找到匹配项</div>
+                    )}
+                  </div>
+                )}
+              </div>
             </label>
             <label className="text-sm space-y-2">
               策略
-              <select
-                className="w-full rounded-xl bg-slate-900/60 border border-white/10 px-3 py-2"
-                value={form.strategy_id}
-                onChange={(e) => {
-                  const nextStrategyId = e.target.value;
-                  const nextStrategy = strategies.find((item) => item.strategy_id === nextStrategyId);
-                  setForm((prev) => ({
-                    ...prev,
-                    strategy_id: nextStrategyId,
-                    strategy_params: buildDefaultStrategyParams(nextStrategy)
-                  }));
-                }}
-              >
-                {strategies.map((strategy) => (
-                  <option key={strategy.strategy_id} value={strategy.strategy_id}>
-                    {strategy.name}
-                  </option>
-                ))}
-              </select>
+              <div className="relative" ref={strategyDropdownRef}>
+                <input
+                  type="text"
+                  className="w-full rounded-xl bg-slate-900/60 border border-white/10 px-3 py-2 pr-8"
+                  value={isStrategyDropdownOpen ? strategySearchInput : selectedStrategyDisplayText}
+                  onChange={(e) => {
+                    setStrategySearchInput(e.target.value);
+                    setIsStrategyDropdownOpen(true);
+                  }}
+                  onFocus={() => {
+                    setIsStrategyDropdownOpen(true);
+                    if (!strategySearchInput && selectedStrategyDisplayText) {
+                      setStrategySearchInput("");
+                    }
+                  }}
+                  onBlur={(e) => {
+                    // 延迟关闭，以便点击选项时能触发
+                    setTimeout(() => {
+                      if (!e.relatedTarget || !strategyDropdownRef.current?.contains(e.relatedTarget as Node)) {
+                        setIsStrategyDropdownOpen(false);
+                        setStrategySearchInput("");
+                      }
+                    }, 200);
+                  }}
+                  placeholder={isStrategyDropdownOpen ? "搜索策略名称或ID..." : "选择策略"}
+                />
+                <button
+                  type="button"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200"
+                  onClick={() => setIsStrategyDropdownOpen(!isStrategyDropdownOpen)}
+                >
+                  <svg
+                    className={`w-4 h-4 transition-transform ${isStrategyDropdownOpen ? "rotate-180" : ""}`}
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                  </svg>
+                </button>
+                {isStrategyDropdownOpen && (
+                  <div className="absolute z-50 w-full mt-1 max-h-60 overflow-auto rounded-xl bg-slate-900/95 border border-white/10 shadow-lg">
+                    {filteredStrategyOptions.length > 0 ? (
+                      filteredStrategyOptions.map((strategy) => {
+                        return (
+                          <button
+                            key={strategy.strategy_id}
+                            type="button"
+                            className="w-full text-left px-3 py-2 hover:bg-slate-800/60 transition text-sm"
+                            onMouseDown={(e) => {
+                              e.preventDefault(); // 防止onBlur先触发
+                            }}
+                            onClick={() => {
+                              setForm((prev) => ({
+                                ...prev,
+                                strategy_id: strategy.strategy_id,
+                                strategy_params: buildDefaultStrategyParams(strategy)
+                              }));
+                              setStrategySearchInput("");
+                              setIsStrategyDropdownOpen(false);
+                            }}
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="flex-1 min-w-0">
+                                <div className="text-slate-200 font-medium truncate">{strategy.name}</div>
+                                <div className="text-xs text-slate-500 truncate mt-0.5">{strategy.strategy_id}</div>
+                              </div>
+                            </div>
+                          </button>
+                        );
+                      })
+                    ) : (
+                      <div className="px-3 py-2 text-sm text-slate-400">未找到匹配项</div>
+                    )}
+                  </div>
+                )}
+              </div>
             </label>
             <label className="text-sm space-y-2">
               初始资金
@@ -823,6 +1264,48 @@ export function BacktestManagementPage() {
                 onChange={(e) => setForm((prev) => ({ ...prev, signal_frequency_seconds: Number(e.target.value) }))}
               />
             </label>
+          </div>
+          <div className="space-y-3">
+            <h4 className="text-sm font-medium text-slate-300">手续费设置</h4>
+            <div className="grid grid-cols-2 gap-4">
+              <label className="text-sm space-y-2">
+                手续费类型
+                <select
+                  className="w-full rounded-xl bg-slate-900/60 border border-white/10 px-3 py-2"
+                  value={form.commission_type}
+                  onChange={(e) => setForm((prev) => ({ ...prev, commission_type: e.target.value as "fixed" | "ratio" }))}
+                >
+                  <option value="fixed">固定</option>
+                  <option value="ratio">比率</option>
+                </select>
+              </label>
+              <label className="text-sm space-y-2">
+                {form.commission_type === "fixed" ? "固定手续费" : "手续费比率"}
+                <input
+                  type="number"
+                  step="any"
+                  min="0"
+                  className="w-full rounded-xl bg-slate-900/60 border border-white/10 px-3 py-2"
+                  value={form.commission_value}
+                  onChange={(e) => setForm((prev) => ({ ...prev, commission_value: Number(e.target.value) }))}
+                  placeholder={form.commission_type === "fixed" ? "每笔交易固定费用" : "手续费比率（如0.001表示0.1%）"}
+                />
+              </label>
+              {form.commission_type === "ratio" && (
+                <label className="text-sm space-y-2">
+                  手续费上限（可选）
+                  <input
+                    type="number"
+                    step="any"
+                    min="0"
+                    className="w-full rounded-xl bg-slate-900/60 border border-white/10 px-3 py-2"
+                    value={form.commission_max ?? ""}
+                    onChange={(e) => setForm((prev) => ({ ...prev, commission_max: e.target.value ? Number(e.target.value) : undefined }))}
+                    placeholder="超过此值按上限扣费（留空表示无上限）"
+                  />
+                </label>
+              )}
+            </div>
           </div>
         {activeStrategy && activeStrategy.parameters.length > 0 && (
           <div className="space-y-3">
