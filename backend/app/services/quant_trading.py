@@ -159,12 +159,23 @@ class QuantTradingManager:
     async def _fetch_available_cash(self, mode: str) -> float:
         def fetch() -> float:
             with LONGPORT_CLIENT.trade_context(mode) as ctx:
-                account = ctx.account_balance()
-                if hasattr(account, "cash"):
-                    return float(account.cash)
-                if hasattr(account, "available_cash"):
-                    return float(account.available_cash)
-                return 1_000_000.0
+                balance_list = ctx.account_balance()
+                if not balance_list:
+                    return 1_000_000.0
+                
+                # Use the first balance (or sum all if multiple currencies)
+                total_available = 0.0
+                for balance in balance_list:
+                    # Try to get available cash from cash_infos
+                    if hasattr(balance, "cash_infos") and balance.cash_infos:
+                        for cash_info in balance.cash_infos:
+                            if hasattr(cash_info, "available_cash"):
+                                total_available += float(cash_info.available_cash)
+                    # Fallback to total_cash if cash_infos not available
+                    elif hasattr(balance, "total_cash"):
+                        total_available += float(balance.total_cash)
+                
+                return total_available if total_available > 0 else 1_000_000.0
 
         try:
             return await asyncio.to_thread(fetch)
@@ -176,10 +187,11 @@ class QuantTradingManager:
     async def _fetch_position(self, mode: str, symbol: str) -> float:
         def fetch() -> float:
             with LONGPORT_CLIENT.trade_context(mode) as ctx:
-                positions = ctx.stock_position()
-                for pos in positions:
-                    if getattr(pos, "symbol", "") == symbol:
-                        return float(getattr(pos, "quantity", 0.0))
+                stock_resp = ctx.stock_positions()
+                for channel in stock_resp.channels:
+                    for pos in channel.positions:
+                        if getattr(pos, "symbol", "") == symbol:
+                            return float(getattr(pos, "quantity", 0.0))
                 return 0.0
 
         try:

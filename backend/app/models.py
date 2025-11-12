@@ -190,10 +190,37 @@ class QuantTaskInfo(BaseModel):
     price_series: Optional[List[Dict[str, Any]]] = None
 
 
+class CashInfo(BaseModel):
+    withdraw_cash: float
+    available_cash: float
+    frozen_cash: float
+    settling_cash: float
+    currency: str
+
+
+class FrozenTransactionFee(BaseModel):
+    currency: str
+    frozen_transaction_fee: float
+
+
+class AccountBalance(BaseModel):
+    total_cash: float
+    max_finance_amount: float
+    remaining_finance_amount: float
+    risk_level: int
+    margin_call: float
+    currency: str
+    cash_infos: List[CashInfo]
+    net_assets: float
+    init_margin: float
+    maintenance_margin: float
+    buy_power: float
+    frozen_transaction_fees: Optional[FrozenTransactionFee] = None
+
+
 class AccountSummary(BaseModel):
     account_mode: str
-    equity: float
-    cash_available: float
+    balances: List[AccountBalance]
     positions: List[Dict[str, Any]]
     today_orders: List[Dict[str, Any]]
 
